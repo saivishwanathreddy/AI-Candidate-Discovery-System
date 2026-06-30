@@ -1,0 +1,26 @@
+# AI Candidate Discovery System — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Web framework ────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9      # required for FastAPI file-upload endpoints
+
+# ── Data validation (Pydantic v2) ────────────────────────────────────────────
+pydantic>=2.7.0
+
+# ── NLP / Embeddings ─────────────────────────────────────────────────────────
+sentence-transformers>=2.7.0
+numpy>=1.26.0
+scikit-learn>=1.4.0          # cosine_similarity in semantic_engine.py
+
+# ── Document parsing ─────────────────────────────────────────────────────────
+python-docx>=1.1.0           # job_parser.py reads .docx job descriptions
+
+# ── Dataset loading ──────────────────────────────────────────────────────────
+jsonschema>=4.22.0           # data_loader.py: Draft7Validator
+tqdm>=4.66.0                 # data_loader.py: progress bar
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+aiofiles>=23.2.1             # async file I/O in FastAPI endpoints
+python-dateutil>=2.9.0       # date parsing used in feature_utils.py

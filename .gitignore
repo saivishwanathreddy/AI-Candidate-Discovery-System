@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+.venv/
+env/
+logs/
+
+# Node
+node_modules/
+dist/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+
+# Build outputs
+build/
+
+# 100k dataset
+dataset/candidates.jsonl
