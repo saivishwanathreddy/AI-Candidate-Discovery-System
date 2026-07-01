@@ -47,6 +47,8 @@ if str(_BACKEND_DIR) not in sys.path:
 import io
 import json
 import logging
+import platform
+import socket
 import tempfile
 import pickle
 import time
@@ -95,16 +97,59 @@ FEATURE_FILE = RUNTIME_DIR / "features.pkl"
 RESULT_FILE = RUNTIME_DIR / "results.pkl"
 
 
-def save_pickle(path, obj):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
+def save_pickle(path, obj) -> None:
+    """
+    Atomically persist *obj* to *path* using pickle.
+
+    Writes to a sibling ``.tmp`` file first, then renames to the final
+    destination.  This guarantees that a process crash mid-write never
+    leaves a partially-written (corrupt) pickle file behind.
+    """
+    tmp_path = path.with_suffix(".tmp")
+    log.debug("[pickle] Writing to tmp: %s", tmp_path)
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())  # ensure OS buffers flushed before rename
+        os.replace(tmp_path, path)  # atomic on POSIX; best-effort on Windows
+        log.debug("[pickle] Saved OK: %s", path)
+    except Exception as exc:
+        log.error("[pickle] SAVE FAILED for %s: %s", path, exc, exc_info=True)
+        # Clean up orphaned tmp file if it exists
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def load_pickle(path):
+    """
+    Load a pickle file from *path*.
+
+    Returns ``None`` if the file does not exist or is corrupt.  A corrupt
+    file is deleted so the next successful save can replace it cleanly.
+    """
     if not path.exists():
+        log.debug("[pickle] File not found (returning None): %s", path)
         return None
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    log.debug("[pickle] Loading: %s", path)
+    try:
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        log.debug("[pickle] Loaded OK: %s", path)
+        return obj
+    except Exception as exc:
+        log.error(
+            "[pickle] CORRUPT FILE — deleting %s and returning None. Error: %s",
+            path, exc, exc_info=True,
+        )
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as del_exc:
+            log.warning("[pickle] Could not delete corrupt file %s: %s", path, del_exc)
+        return None
 
 # ===========================================================================
 # Application factory
@@ -149,19 +194,75 @@ app.state.engine_config: EngineConfig = EngineConfig()
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Ensure required directories exist and log a startup banner."""
-    log.info("=" * 60)
-    log.info("  AI Candidate Discovery System — starting up")
-    log.info("  Project root : %s", PROJECT_ROOT)
-    log.info("  Dataset dir  : %s", PROJECT_ROOT / 'dataset')
-    log.info("=" * 60)
+    """
+    Startup hook: log a banner, ensure directories exist, and eagerly restore
+    any previously-persisted pipeline state from the runtime pickle files.
+
+    Eager restoration prevents the race condition where two concurrent
+    requests both see ``app.state.job_profile = None`` and both race to
+    call ``load_pickle()`` before either has stored the result.
+    """
     # Ensure logs directory exists (logger.py creates it, but be defensive)
     (PROJECT_ROOT / "logs").mkdir(parents=True, exist_ok=True)
+
+    log.info("=" * 60)
+    log.info("  AI Candidate Discovery System — starting up")
+    log.info("  PID          : %d", os.getpid())
+    log.info("  Hostname     : %s", socket.gethostname())
+    log.info("  Platform     : %s", platform.platform())
+    log.info("  Project root : %s", PROJECT_ROOT)
+    log.info("  Runtime dir  : %s", RUNTIME_DIR)
+    log.info("=" * 60)
+
+    # ── Eagerly restore persisted state ─────────────────────────────────────
+    log.info("[startup] Restoring pipeline state from disk …")
+
+    # Job profile
+    loaded_job = load_pickle(JOB_FILE)
+    if loaded_job is not None:
+        app.state.job_profile = loaded_job
+        log.info(
+            "[startup] job_profile restored: %s @ %s",
+            getattr(loaded_job, 'job_title', '?'),
+            getattr(loaded_job, 'company', '?'),
+        )
+    else:
+        log.info("[startup] No job_profile on disk (clean slate)")
+
+    # Candidates
+    loaded_cands = load_pickle(CAND_FILE)
+    if loaded_cands:
+        app.state.candidates = loaded_cands
+        log.info("[startup] candidates restored: %d records", len(loaded_cands))
+    else:
+        log.info("[startup] No candidates on disk (clean slate)")
+
+    # Features
+    loaded_features = load_pickle(FEATURE_FILE)
+    if loaded_features:
+        app.state.features = loaded_features
+        log.info("[startup] features restored: %d vectors", len(loaded_features))
+    else:
+        log.info("[startup] No features on disk")
+
+    # Shortlist / results
+    loaded_shortlist = load_pickle(RESULT_FILE)
+    if loaded_shortlist is not None:
+        app.state.shortlist = loaded_shortlist
+        log.info(
+            "[startup] shortlist restored: %d ranked candidates",
+            len(getattr(loaded_shortlist, 'ranked_candidates', [])),
+        )
+    else:
+        log.info("[startup] No shortlist on disk")
+
+    log.info("[startup] State restoration complete")
+    log.info("=" * 60)
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    log.info("AI Candidate Discovery System — shutting down")
+    log.info("AI Candidate Discovery System — shutting down (PID=%d)", os.getpid())
 
 
 # ===========================================================================
@@ -215,9 +316,26 @@ class UploadCandidatesResponse(BaseModel):
 # ===========================================================================
 
 def _require_job() -> JobProfile:
-    """Raise 400 if no job profile has been uploaded yet."""
+    """
+    Return the current JobProfile from in-process state or, on a fresh
+    restart, from the persisted pickle file.
+
+    Raises HTTP 400 if neither source has a valid profile.
+    """
     if app.state.job_profile is None:
+        log.info("[_require_job] In-memory job_profile is None — attempting disk restore from %s", JOB_FILE)
         app.state.job_profile = load_pickle(JOB_FILE)
+        if app.state.job_profile is not None:
+            log.info(
+                "[_require_job] Restored job_profile from disk: %s @ %s",
+                getattr(app.state.job_profile, 'job_title', '?'),
+                getattr(app.state.job_profile, 'company', '?'),
+            )
+        else:
+            log.warning(
+                "[_require_job] No job_profile found on disk (%s). "
+                "Raising HTTP 400.", JOB_FILE
+            )
 
     if app.state.job_profile is None:
         raise HTTPException(
@@ -228,10 +346,25 @@ def _require_job() -> JobProfile:
 
 
 def _require_candidates() -> List[Any]:
-    """Raise 400 if no candidates have been loaded yet."""
+    """
+    Return the current candidate list from in-process state or, on a fresh
+    restart, from the persisted pickle file.
 
+    Raises HTTP 400 if neither source has candidates.
+    """
     if not app.state.candidates:
+        log.info("[_require_candidates] In-memory candidates empty — attempting disk restore from %s", CAND_FILE)
         app.state.candidates = load_pickle(CAND_FILE) or []
+        if app.state.candidates:
+            log.info(
+                "[_require_candidates] Restored %d candidates from disk",
+                len(app.state.candidates),
+            )
+        else:
+            log.warning(
+                "[_require_candidates] No candidates found on disk (%s). "
+                "Raising HTTP 400.", CAND_FILE
+            )
 
     if not app.state.candidates:
         raise HTTPException(
@@ -243,9 +376,25 @@ def _require_candidates() -> List[Any]:
 
 
 def _require_results() -> ShortlistResult:
-    """Raise 400 if analysis hasn't been run yet."""
+    """
+    Return the current ShortlistResult from in-process state or, on a fresh
+    restart, from the persisted pickle file.
+
+    Raises HTTP 400 if neither source has results.
+    """
     if app.state.shortlist is None:
+        log.info("[_require_results] In-memory shortlist is None — attempting disk restore from %s", RESULT_FILE)
         app.state.shortlist = load_pickle(RESULT_FILE)
+        if app.state.shortlist is not None:
+            log.info(
+                "[_require_results] Restored shortlist from disk: %d candidates",
+                len(getattr(app.state.shortlist, 'ranked_candidates', [])),
+            )
+        else:
+            log.warning(
+                "[_require_results] No shortlist found on disk (%s). "
+                "Raising HTTP 400.", RESULT_FILE
+            )
 
     if app.state.shortlist is None:
         raise HTTPException(
@@ -363,25 +512,34 @@ async def upload_job(
             log.info("Parsing default JD: %s", default_jd)
             profile = parse_job_description(default_jd)
 
-    except HTTPException:
+    except HTTPException as exc:
+        log.warning(
+            "[upload_job] HTTPException during JD parse — re-raising. "
+            "status=%s", getattr(exc, 'status_code', '?')
+        )
         raise
     except Exception as exc:
-        log.exception("Job description parsing failed: %s", exc)
+        log.exception("[upload_job] Job description parsing failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to parse job description: {exc}",
         ) from exc
 
+    # ── Persist and update in-process state ─────────────────────────────────
+    log.info(
+        "[upload_job] Storing job_profile in memory: title=%s company=%s req_skills=%d",
+        profile.job_title, profile.company, profile.required_skill_count(),
+    )
     app.state.job_profile = profile
+
+    log.info("[upload_job] Persisting job_profile to disk: %s", JOB_FILE)
     save_pickle(JOB_FILE, profile)
+    log.info("[upload_job] job_profile persisted OK")
+
     # Clear downstream state so stale results don't linger
     app.state.features = []
     app.state.shortlist = None
-
-    log.info(
-        "JobProfile stored | title=%s | company=%s | req_skills=%d",
-        profile.job_title, profile.company, profile.required_skill_count(),
-    )
+    log.info("[upload_job] Cleared downstream features + shortlist state")
 
     return UploadJobResponse(
         status="ok",
@@ -505,23 +663,37 @@ async def upload_candidates(
             )
             source = "candidates.jsonl (default)"
 
-    except HTTPException:
+    except HTTPException as exc:
+        log.warning(
+            "[upload_candidates] HTTPException during candidate load — re-raising. "
+            "status=%s", getattr(exc, 'status_code', '?')
+        )
         raise
     except Exception as exc:
-        log.exception("Candidate loading failed: %s", exc)
+        log.exception("[upload_candidates] Candidate loading failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load candidates: {exc}",
         ) from exc
 
+    # ── Persist and update in-process state ─────────────────────────────────
+    log.info(
+        "[upload_candidates] Storing %d candidates in memory (source=%s)",
+        len(result.candidates), source,
+    )
     app.state.candidates = result.candidates
+
+    log.info("[upload_candidates] Persisting candidates to disk: %s", CAND_FILE)
     save_pickle(CAND_FILE, result.candidates)
+    log.info("[upload_candidates] Candidates persisted OK")
+
     # Clear downstream state
     app.state.features = []
     app.state.shortlist = None
+    log.info("[upload_candidates] Cleared downstream features + shortlist state")
 
     log.info(
-        "Candidates stored | valid=%d | invalid=%d | source=%s",
+        "[upload_candidates] Complete | valid=%d | invalid=%d | source=%s",
         result.valid_count, result.invalid_count, source,
     )
 
@@ -567,8 +739,13 @@ async def analyze(body: Optional[AnalyzeRequest] = None) -> Dict[str, Any]:
     from ranking_engine import RankingEngine
 
     # ── Prerequisites ──────────────────────────────────────────────────────
+    log.info("[analyze] Checking prerequisites …")
     job = _require_job()
     candidates = _require_candidates()
+    log.info(
+        "[analyze] Prerequisites OK — job='%s @ %s', candidates=%d",
+        job.job_title, job.company, len(candidates),
+    )
 
     # ── Build EngineConfig from request (or defaults) ──────────────────────
     req = body or AnalyzeRequest()
@@ -582,62 +759,141 @@ async def analyze(body: Optional[AnalyzeRequest] = None) -> Dict[str, Any]:
         embedding_model=req.embedding_model,
     )
     app.state.engine_config = config
+    log.info(
+        "[analyze] EngineConfig — model=%s top_k=%d weights=(sem=%.2f tech=%.2f exp=%.2f beh=%.2f tru=%.2f)",
+        config.embedding_model, config.top_k,
+        config.weight_semantic, config.weight_technical,
+        config.weight_experience, config.weight_behavior, config.weight_trust,
+    )
 
     pipeline_start = time.perf_counter()
     log.info("=" * 60)
-    log.info("Starting analysis pipeline")
-    log.info("  Candidates : %d", len(candidates))
-    log.info("  Job        : %s @ %s", job.job_title, job.company)
-    log.info("  top_k      : %d", config.top_k)
+    log.info("[analyze] Starting analysis pipeline")
+    log.info("[analyze]   PID        : %d", os.getpid())
+    log.info("[analyze]   Hostname   : %s", socket.gethostname())
+    log.info("[analyze]   Candidates : %d", len(candidates))
+    log.info("[analyze]   Job        : %s @ %s", job.job_title, job.company)
+    log.info("[analyze]   top_k      : %d", config.top_k)
     log.info("=" * 60)
 
+    # =========================================================================
+    # Stage 1: Feature Engineering
+    # =========================================================================
+    log.info("[analyze] [1/3] >>> BEGIN Feature Engineering — %d candidates", len(candidates))
+    t0 = time.perf_counter()
     try:
-        # ── Stage 1 : Feature Engineering ────────────────────────────────
-        log.info("[1/3] Feature Engineering …")
-        t0 = time.perf_counter()
         engine = FeatureEngine(job_profile=job, config=config)
         features: List[CandidateFeatures] = engine.batch_extract(
-            candidates, log_interval=1000
+            candidates, log_interval=500
         )
+        stage1_time = time.perf_counter() - t0
         log.info(
-            "[1/3] Feature Engineering done in %.2fs — %d feature vectors",
-            time.perf_counter() - t0, len(features),
+            "[analyze] [1/3] <<< END Feature Engineering — %d vectors in %.2fs",
+            len(features), stage1_time,
         )
-
-        # ── Stage 2 : Semantic Matching ───────────────────────────────────
-        log.info("[2/3] Semantic Matching …")
-        t0 = time.perf_counter()
-        sem_engine = SemanticEngine(config=config)
-        features = sem_engine.attach_scores(features, job)
-        log.info(
-            "[2/3] Semantic Matching done in %.2fs",
-            time.perf_counter() - t0,
-        )
-
-        # ── Stage 3 : Hybrid Ranking + Explainability ─────────────────────
-        log.info("[3/3] Hybrid Ranking + Explainability …")
-        t0 = time.perf_counter()
-        ranker = RankingEngine(config=config, job_profile=job)
-        ranked: List[RankedCandidate] = ranker.rank(features)
-        log.info(
-            "[3/3] Ranking done in %.2fs — top-%d returned",
-            time.perf_counter() - t0, len(ranked),
-        )
-
+        if not features:
+            log.error(
+                "[analyze] [1/3] Feature Engineering returned ZERO vectors — "
+                "all %d candidates failed extraction. Raising HTTP 500.",
+                len(candidates),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Feature Engineering produced no output. All candidates "
+                    "failed extraction. Check the feature_engine logs."
+                ),
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
-        log.exception("Analysis pipeline failed: %s", exc)
+        stage1_time = time.perf_counter() - t0
+        log.exception(
+            "[analyze] [1/3] Feature Engineering FAILED after %.2fs: %s",
+            stage1_time, exc,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Analysis pipeline failed: {exc}",
+            detail=f"Feature Engineering failed: {exc}",
         ) from exc
 
-    # ── Store features (for /candidate/{id} detail lookups) ───────────────
-    app.state.features = features
-    save_pickle(FEATURE_FILE, features)
+    # =========================================================================
+    # Stage 2: Semantic Matching
+    # =========================================================================
+    log.info(
+        "[analyze] [2/3] >>> BEGIN Semantic Matching — model=%s, %d feature vectors",
+        config.embedding_model, len(features),
+    )
+    t0 = time.perf_counter()
+    try:
+        sem_engine = SemanticEngine(config=config)
+        log.info("[analyze] [2/3] Loading / verifying embedding model …")
+        features = sem_engine.attach_scores(features, job)
+        stage2_time = time.perf_counter() - t0
+        log.info(
+            "[analyze] [2/3] <<< END Semantic Matching — %.2fs",
+            stage2_time,
+        )
+    except Exception as exc:
+        stage2_time = time.perf_counter() - t0
+        log.exception(
+            "[analyze] [2/3] Semantic Matching FAILED after %.2fs: %s",
+            stage2_time, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Semantic Matching failed: {exc}",
+        ) from exc
+
+    # =========================================================================
+    # Stage 3: Hybrid Ranking + Explainability
+    # =========================================================================
+    log.info(
+        "[analyze] [3/3] >>> BEGIN Hybrid Ranking + Explainability — %d candidates",
+        len(features),
+    )
+    t0 = time.perf_counter()
+    try:
+        ranker = RankingEngine(config=config, job_profile=job)
+        ranked: List[RankedCandidate] = ranker.rank(features)
+        stage3_time = time.perf_counter() - t0
+        log.info(
+            "[analyze] [3/3] <<< END Ranking + Explainability — top-%d in %.2fs",
+            len(ranked), stage3_time,
+        )
+    except Exception as exc:
+        stage3_time = time.perf_counter() - t0
+        log.exception(
+            "[analyze] [3/3] Ranking FAILED after %.2fs: %s",
+            stage3_time, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ranking + Explainability failed: {exc}",
+        ) from exc
 
     total_time = time.perf_counter() - pipeline_start
 
+    # =========================================================================
+    # Persist results (outside pipeline stages — errors here are storage errors)
+    # =========================================================================
+    log.info("[analyze] Persisting features (%d vectors) to disk …", len(features))
+    try:
+        app.state.features = features
+        save_pickle(FEATURE_FILE, features)
+        log.info("[analyze] Features persisted OK: %s", FEATURE_FILE)
+    except Exception as exc:
+        # Non-fatal: features may not be accessible via /candidate/{id} but
+        # the analysis result is still valid.  Log and continue.
+        log.error(
+            "[analyze] WARNING: Could not persist features to disk: %s. "
+            "GET /candidate/{id} may not return full feature vectors.",
+            exc, exc_info=True,
+        )
+        app.state.features = features  # still keep in-memory
+
     # ── Build ShortlistResult ─────────────────────────────────────────────
+    log.info("[analyze] Building ShortlistResult …")
     weights = config.normalised_weights()
     shortlist = ShortlistResult(
         job_title=job.job_title,
@@ -651,15 +907,29 @@ async def analyze(body: Optional[AnalyzeRequest] = None) -> Dict[str, Any]:
         engine_version="1.0.0",
         weights_used=weights,
     )
-    app.state.shortlist = shortlist
-    save_pickle(RESULT_FILE, shortlist)
 
+    log.info("[analyze] Persisting shortlist to disk …")
+    try:
+        app.state.shortlist = shortlist
+        save_pickle(RESULT_FILE, shortlist)
+        log.info("[analyze] Shortlist persisted OK: %s", RESULT_FILE)
+    except Exception as exc:
+        log.error(
+            "[analyze] WARNING: Could not persist shortlist to disk: %s. "
+            "Results are available in-memory for this instance's lifetime only.",
+            exc, exc_info=True,
+        )
+        app.state.shortlist = shortlist  # still keep in-memory
+
+    top_score = ranked[0].score if ranked else 0.0
+    top_candidate_id = ranked[0].candidate_id if ranked else "N/A"
     log.info(
-        "Pipeline complete | time=%.2fs | top_k=%d | top_score=%.4f",
-        total_time,
-        len(ranked),
-        ranked[0].score if ranked else 0.0,
+        "[analyze] Pipeline COMPLETE | total_time=%.2fs | stage1=%.2fs | "
+        "stage2=%.2fs | stage3=%.2fs | ranked=%d | top_score=%.4f | top_id=%s",
+        total_time, stage1_time, stage2_time, stage3_time,
+        len(ranked), top_score, top_candidate_id,
     )
+    log.info("=" * 60)
 
     return {
         "status": "ok",
@@ -789,10 +1059,14 @@ async def get_candidate(candidate_id: str) -> Dict[str, Any]:
 
 @app.exception_handler(Exception)
 async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
-    log.exception("Unhandled exception on %s %s: %s", request.method, request.url.path, exc)
+    log.exception(
+        "[unhandled_exception] %s %s | PID=%d | %s: %s",
+        request.method, request.url.path, os.getpid(),
+        type(exc).__name__, exc,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"status": "error", "detail": str(exc)},
+        content={"status": "error", "detail": str(exc), "type": type(exc).__name__},
     )
 
 
