@@ -48,6 +48,7 @@ import io
 import json
 import logging
 import tempfile
+import pickle
 import time
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +81,30 @@ from candidate_models import (
 # heavy model downloads at import time (sentence-transformers, etc.)
 
 log = get_logger(__name__)
+
+# ---------------------------------------------------------
+# Persistent Runtime Storage
+# ---------------------------------------------------------
+
+RUNTIME_DIR = PROJECT_ROOT / "backend" / "runtime"
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+JOB_FILE = RUNTIME_DIR / "job.pkl"
+CAND_FILE = RUNTIME_DIR / "candidates.pkl"
+FEATURE_FILE = RUNTIME_DIR / "features.pkl"
+RESULT_FILE = RUNTIME_DIR / "results.pkl"
+
+
+def save_pickle(path, obj):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def load_pickle(path):
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 # ===========================================================================
 # Application factory
@@ -192,6 +217,9 @@ class UploadCandidatesResponse(BaseModel):
 def _require_job() -> JobProfile:
     """Raise 400 if no job profile has been uploaded yet."""
     if app.state.job_profile is None:
+        app.state.job_profile = load_pickle(JOB_FILE)
+
+    if app.state.job_profile is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No job profile loaded. Call POST /upload-job first.",
@@ -202,6 +230,11 @@ def _require_job() -> JobProfile:
 def _require_candidates() -> List[Any]:
     """Raise 400 if no candidates have been loaded yet."""
     if not app.state.candidates:
+        loaded = load_pickle(CAND_FILE)
+    if loaded:
+        app.state.candidates = loaded
+
+    if not app.state.candidates:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No candidates loaded. Call POST /upload-candidates first.",
@@ -211,6 +244,9 @@ def _require_candidates() -> List[Any]:
 
 def _require_results() -> ShortlistResult:
     """Raise 400 if analysis hasn't been run yet."""
+    if app.state.shortlist is None:
+        app.state.shortlist = load_pickle(RESULT_FILE)
+
     if app.state.shortlist is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -337,6 +373,7 @@ async def upload_job(
         ) from exc
 
     app.state.job_profile = profile
+    save_pickle(JOB_FILE, profile)
     # Clear downstream state so stale results don't linger
     app.state.features = []
     app.state.shortlist = None
@@ -365,7 +402,7 @@ async def upload_job(
     response_model=UploadCandidatesResponse,
     status_code=status.HTTP_200_OK,
     tags=["Pipeline"],
-)
+)   
 async def upload_candidates(
     file: Optional[UploadFile] = File(default=None),
     max_records: Optional[int] = Query(
@@ -478,6 +515,7 @@ async def upload_candidates(
         ) from exc
 
     app.state.candidates = result.candidates
+    save_pickle(CAND_FILE, result.candidates)
     # Clear downstream state
     app.state.features = []
     app.state.shortlist = None
@@ -595,6 +633,7 @@ async def analyze(body: Optional[AnalyzeRequest] = None) -> Dict[str, Any]:
 
     # ── Store features (for /candidate/{id} detail lookups) ───────────────
     app.state.features = features
+    save_pickle(FEATURE_FILE, features)
 
     total_time = time.perf_counter() - pipeline_start
 
@@ -613,6 +652,7 @@ async def analyze(body: Optional[AnalyzeRequest] = None) -> Dict[str, Any]:
         weights_used=weights,
     )
     app.state.shortlist = shortlist
+    save_pickle(RESULT_FILE, shortlist)
 
     log.info(
         "Pipeline complete | time=%.2fs | top_k=%d | top_score=%.4f",
@@ -723,6 +763,12 @@ async def get_candidate(candidate_id: str) -> Dict[str, Any]:
 
     # ── Attach full feature vector ────────────────────────────────────────
     feature_vec: Optional[CandidateFeatures] = None
+
+    if not app.state.features:
+        loaded = load_pickle(FEATURE_FILE)
+        if loaded:
+            app.state.features = loaded
+
     for feat in app.state.features:
         if feat.candidate_id == candidate_id:
             feature_vec = feat
