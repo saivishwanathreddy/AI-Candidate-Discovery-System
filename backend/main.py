@@ -229,16 +229,16 @@ def _require_job() -> JobProfile:
 
 def _require_candidates() -> List[Any]:
     """Raise 400 if no candidates have been loaded yet."""
+
     if not app.state.candidates:
-        loaded = load_pickle(CAND_FILE)
-    if loaded:
-        app.state.candidates = loaded
+        app.state.candidates = load_pickle(CAND_FILE) or []
 
     if not app.state.candidates:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No candidates loaded. Call POST /upload-candidates first.",
         )
+
     return app.state.candidates
 
 

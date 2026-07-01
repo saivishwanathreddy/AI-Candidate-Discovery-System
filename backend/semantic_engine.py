@@ -49,10 +49,19 @@ def _get_model(model_name: str):
         log.info("Loading SentenceTransformer model: %s", model_name)
         try:
             from sentence_transformers import SentenceTransformer
-            _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
-            log.info("Model loaded successfully: %s", model_name)
-        except Exception as exc:
-            log.error("Failed to load SentenceTransformer model '%s': %s", model_name, exc)
+
+            log.info("Import successful.")
+
+            _MODEL_CACHE[model_name] = SentenceTransformer(
+                model_name,
+                device="cpu"
+            )
+
+            log.info("Model loaded successfully.")
+
+        except Exception:
+            import traceback
+            log.error(traceback.format_exc())
             raise
     return _MODEL_CACHE[model_name]
 
